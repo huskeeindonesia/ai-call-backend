@@ -1,0 +1,632 @@
+Technical Requirement Document
+Project Name: AI Calling Backend v1
+ Document Type: Final Technical Requirement Document
+ Scope: Backend only
+ Primary Goal: Membangun backend yang dapat menerima trigger API dari Postman untuk melakukan outbound call ke nomor tujuan, lalu saat panggilan diangkat sistem menghubungkan audio call ke gpt-realtime-mini agar AI dapat berbicara secara real-time.
+ Voice Provider Options: Twilio atau Telnyx
+ AI Engine: OpenAI Realtime (gpt-realtime-mini)
+ Recommended Backend Stack: Express.js (Node.js)
+ Recommended Deployment for POC: Google Cloud Run
+1. Objective
+Sistem harus menyediakan endpoint HTTPS yang dapat dipanggil dari Postman untuk memicu outbound call ke nomor tujuan.
+Sistem harus mendukung integrasi dengan Twilio dan Telnyx, dengan arsitektur provider-agnostic agar salah satu provider dapat dipilih tanpa mengubah core business logic.
+Saat call diangkat, backend harus membuat sesi real-time dengan gpt-realtime-mini dan AI harus mulai berbicara menggunakan first_message yang telah ditentukan.
+Sistem harus mendukung prompt dan script yang bisa dikustomisasi user, termasuk:
+system instruction,
+first message,
+conversation behavior,
+extraction goals,
+structured output schema.
+Sistem harus mendukung dynamic variables generik, tanpa asumsi use case tertentu, sehingga bisa dipakai untuk debt reminder, sales call, customer service, verification call, survey call, dan use case lain.
+Sistem harus menyimpan hasil akhir call dalam bentuk:
+transcript,
+summary,
+structured output,
+metadata call,
+logs,
+provider events,
+AI session events.
+Sistem harus cukup fleksibel untuk dijadikan fondasi produk AI calling ke depan, walaupun Stage 1 hanya fokus pada proof-of-function backend.
+2. Scope
+2.1 In Scope
+Endpoint backend untuk trigger outbound call.
+Integrasi outbound voice dengan Twilio.
+Integrasi outbound voice dengan Telnyx.
+Webhook handling untuk lifecycle call.
+Media streaming bridge antara provider voice dan OpenAI Realtime.
+Prompt assembly dan dynamic variable injection.
+First message playback melalui AI.
+Real-time speech conversation antara AI dan callee.
+Summary generation setelah call selesai.
+Structured output extraction berdasarkan schema yang dikirim user.
+Logging, tracing, error handling, dan observability dasar.
+Database architecture design guidance untuk penyimpanan call workflow secara production-minded.
+2.2 Out of Scope
+Frontend Flutter.
+Dashboard admin.
+Campaign management UI.
+User management UI.
+Billing UI.
+Advanced analytics UI.
+Workforce management.
+Human handoff UI.
+3. Core Product Principles
+Backend harus provider-agnostic sehingga Twilio dan Telnyx diperlakukan sebagai adapter, bukan sebagai pusat logic aplikasi.
+Backend harus AI-provider-aware but logic-centric, artinya logic bisnis tidak boleh tersebar di prompt saja; sebagian rule penting harus tetap berada di backend.
+Backend harus configuration-driven, sehingga banyak behavior bisa diubah lewat payload atau configuration tanpa perlu ubah code inti.
+Backend harus testable from Postman first, karena owner akan memvalidasi keberhasilan sistem dari API endpoint sebelum frontend dibuat.
+Backend harus generic by design, bukan dibangun terlalu spesifik untuk debt reminder.
+Backend harus resilient, artinya kegagalan provider, AI session, transcript extraction, atau media session harus ditangani dengan jelas.
+4. High-Level Architecture
+4.1 Logical Components
+Public API Layer
+menerima request dari Postman atau sistem lain,
+memvalidasi payload,
+membuat call job,
+memulai outbound call melalui provider.
+Voice Provider Adapter Layer
+mengabstraksi Twilio dan Telnyx,
+menangani create call,
+menerima event webhook,
+mengelola hangup,
+menghubungkan media stream.
+Realtime Media Bridge
+menjembatani audio dari provider ke OpenAI Realtime,
+mengubah session call menjadi session AI,
+menangani stream lifecycle,
+menjaga state media connection.
+Conversation Orchestrator
+menyusun prompt final,
+menyisipkan dynamic variables,
+memastikan first message sesuai template,
+mengelola structured output goals,
+mengelola termination policy.
+Call State Manager
+mengelola state call dari queued sampai completed,
+melacak event penting,
+menyatukan status provider, AI, dan backend.
+Persistence Layer
+menyimpan metadata call,
+menyimpan event timeline,
+menyimpan transcript,
+menyimpan summary,
+menyimpan structured output,
+menyimpan audit log dan error log.
+Observability Layer
+structured logging,
+trace per call,
+metrics,
+error classification.
+5. End-to-End Flow
+5.1 Trigger Phase
+Owner mengirim request ke endpoint POST /v1/calls/outbound.
+Backend memvalidasi token auth.
+Backend memvalidasi payload request.
+Backend membuat internal call record dengan status awal.
+Backend memilih provider adapter berdasarkan parameter request atau default configuration.
+Backend memanggil provider untuk membuat outbound call.
+Backend mengembalikan response sinkron bahwa request diterima.
+5.2 Provider Call Setup Phase
+Provider mulai melakukan outbound call ke nomor tujuan.
+Provider mengirim callback / webhook terkait status call.
+Jika configured, provider dapat menjalankan answering machine detection.
+Jika call dijawab manusia, provider melanjutkan ke media connection.
+Jika voicemail / machine terdeteksi dan rule mengharuskan hangup, call ditutup dan status akhir dicatat.
+5.3 AI Session Phase
+Saat media channel aktif, backend membuka sesi ke OpenAI Realtime.
+Backend menyusun session context:
+system prompt,
+first message,
+dynamic variables,
+structured output schema,
+termination rules,
+optional fallback instructions.
+AI mulai berbicara menggunakan first message.
+Customer merespons.
+Audio customer dikirim ke AI secara realtime.
+AI merespons kembali secara realtime.
+Transcript dan event penting dicatat sepanjang sesi.
+5.4 Completion Phase
+Call berakhir karena salah satu dari:
+AI selesai,
+user menutup call,
+provider memutus call,
+timeout,
+silence threshold,
+explicit hangup rule.
+Backend membuat summary hasil percakapan.
+Backend menghasilkan structured output final.
+Backend menyimpan outcome call dan seluruh artifact penting.
+Owner bisa mengambil hasil melalui endpoint status / detail call.
+6. Functional Requirements
+6.1 Outbound Call Trigger API
+Endpoint
+POST /v1/calls/outbound
+Purpose
+Endpoint utama untuk testing dan triggering outbound call.
+Minimum Capability
+Endpoint harus menerima payload JSON.
+Endpoint harus mengharuskan authentication.
+Endpoint harus mendukung provider selection:
+twilio
+telnyx
+Endpoint harus mendukung pengiriman target phone number.
+Endpoint harus mendukung pengiriman source phone number atau menggunakan default provider number.
+Endpoint harus mendukung pengiriman prompt dan configuration yang diperlukan AI.
+Endpoint harus mendukung dynamic variables generik.
+Endpoint harus mendukung structured output schema generik.
+Endpoint harus mendukung termination rules.
+Endpoint harus mengembalikan internal call_id dan status awal.
+Example Request Concept
+Payload harus mendukung elemen-elemen ini:
+provider
+to
+from
+language
+voice_model
+first_message_template
+system_prompt_template
+variables
+structured_output_schema
+conversation_rules
+termination_rules
+provider_options
+Example Use Cases
+User ingin AI jadi debt reminder.
+User ingin AI jadi sales agent.
+User ingin AI jadi CS.
+User ingin AI jadi survey interviewer.
+User ingin AI jadi verification caller.
+Semua use case ini harus bisa berjalan tanpa ubah code inti, cukup dengan payload dan configuration.
+6.2 Call Status Retrieval API
+Endpoint
+GET /v1/calls/:callId
+Purpose
+Mengambil status dan hasil detail call.
+Required Data
+internal call id
+provider
+provider call id
+current status
+timestamps penting
+transcript summary
+structured output
+hangup reason
+AI session info
+provider event summary
+6.3 Optional Call Detail API
+Endpoint
+GET /v1/calls/:callId/details
+Purpose
+Mengambil detail lengkap event timeline.
+Required Data
+request payload snapshot
+final resolved prompt snapshot
+call lifecycle events
+AI session events
+transcript
+output extraction
+errors and warnings
+6.4 Manual Hangup API
+Endpoint
+POST /v1/calls/:callId/hangup
+Purpose
+Memberi kemampuan manual terminate saat debugging atau testing.
+6.5 Health API
+Endpoint
+GET /health
+Purpose
+Liveness dan readiness check.
+7. Prompting and Customization Requirements
+7.1 System Prompt
+User harus bisa menentukan system_prompt_template sendiri.
+Prompt harus bisa menerima dynamic variables.
+Prompt final harus dibentuk di backend, bukan di client.
+Prompt final yang dipakai saat call harus disimpan sebagai snapshot untuk audit dan debugging.
+7.2 First Message
+first_message_template harus bisa dikustomisasi user.
+First message harus mendukung placeholder variables.
+First message harus diperlakukan sebagai prioritas tinggi karena ini adalah opening call.
+Sistem harus memastikan first message yang dikirim ke AI sudah ter-resolve dengan variable yang benar sebelum sesi dimulai.
+Jika required variable untuk first message tidak tersedia, sistem harus:
+fail fast,
+atau memakai fallback default yang jelas.
+7.3 Dynamic Variables
+Dynamic variables harus bersifat generic dictionary, bukan daftar field bisnis yang dipaksa oleh sistem.
+User bebas mengirim key-value apa pun selama memenuhi validation rules.
+Backend hanya perlu memastikan:
+variables tersimpan,
+variables bisa di-resolve ke prompt,
+variables bisa dipakai untuk structured output guidance bila diperlukan.
+Backend tidak boleh mengasumsikan field seperti days_past_due, amount_due, atau loan_product_name selalu ada.
+Variabel yang dipakai dalam payload harus bisa dipakai juga dalam:
+system prompt,
+first message,
+summary prompt,
+extraction prompt.
+8. Structured Output Requirements
+8.1 General Principle
+Structured output harus customizable by user.
+User harus bisa menentukan sendiri field apa yang ingin diekstrak dari percakapan.
+Backend tidak boleh membatasi structured output ke use case tertentu.
+8.2 Structured Output Schema
+Request outbound call harus bisa menyertakan schema structured output.
+Schema dapat berupa daftar field yang diinginkan user.
+Setiap field bisa punya atribut seperti:
+field name,
+description,
+type,
+required / optional,
+normalization hint.
+Backend harus menggunakan schema ini sebagai dasar extraction result.
+Hasil extraction final harus disimpan apa adanya dalam bentuk object terstruktur.
+8.3 Example Concept
+Misalnya user ingin structured output berisi:
+customer_name_confirmed,
+callback_date,
+callback_time,
+issue_type,
+agreement_status,
+notes.
+Atau user lain ingin:
+intent,
+appointment_date,
+budget_amount,
+city,
+preferred_contact_time.
+Sistem harus bisa mendukung semuanya.
+8.4 Summary
+Setiap call harus menghasilkan summary.
+Summary harus dibuat setelah call selesai.
+Summary harus fokus pada isi percakapan, bukan sekadar status teknis.
+Summary harus cukup ringkas untuk dibaca manusia dan cukup akurat untuk operasional.
+9. Conversation Behavior Requirements
+AI harus mampu berbicara dua arah secara real-time.
+AI harus dapat menggunakan first message sebagai pembuka.
+AI harus mengikuti system instruction dan conversation rules.
+AI harus tidak berbicara terlalu panjang.
+AI harus memberi kesempatan user berbicara.
+AI harus bisa melakukan klarifikasi jika informasi tidak jelas.
+AI harus bisa mengonfirmasi hasil penting sebelum call ditutup bila use case memerlukannya.
+AI harus berhenti bila termination rule tercapai.
+AI harus tetap mengutamakan sopan santun dan tone yang sesuai konfigurasi.
+Jika transcript parsial atau noisy terjadi, backend tetap harus berusaha menghasilkan output final terbaik yang mungkin, namun menandai confidence atau status ketidaklengkapan jika dibutuhkan.
+10. Termination and Control Requirements
+Backend harus mendukung max_call_duration.
+Backend harus mendukung max_silence_duration.
+Backend harus mendukung max_reprompt_count.
+Backend harus mendukung hangup_on_machine_detection.
+Backend harus mendukung hangup_on_ai_failure.
+Backend harus mendukung keyword_triggered_hangup.
+Backend harus mendukung explicit disposition-based termination, misalnya jika AI menyimpulkan call harus selesai.
+Backend harus mendukung manual operator-triggered hangup via API.
+Semua alasan akhir penutupan call harus dicatat jelas.
+11. Provider Adapter Requirements
+11.1 General
+Provider adapter harus menjadi lapisan terpisah.
+Core app tidak boleh bergantung langsung pada detail Twilio atau Telnyx.
+Setiap provider harus mengimplementasikan fungsi inti:
+create outbound call,
+handle lifecycle events,
+terminate call,
+expose media stream integration,
+map provider-specific statuses ke internal canonical statuses.
+11.2 Twilio Adapter
+Adapter harus mendukung outbound call creation.
+Adapter harus mendukung status callbacks.
+Adapter harus mendukung media stream untuk real-time voice bridge.
+Adapter harus mendukung machine / voicemail detection bila diaktifkan.
+Adapter harus mendukung hangup API call.
+11.3 Telnyx Adapter
+Adapter harus mendukung outbound call creation.
+Adapter harus mendukung event webhooks.
+Adapter harus mendukung media streaming.
+Adapter harus mendukung machine / voicemail detection bila diaktifkan.
+Adapter harus mendukung hangup API call.
+12. Database Architecture Requirements
+Saya tidak menentukan struktur tabel spesifik, tetapi engineering team wajib mendesain database architecture yang kuat dengan prinsip berikut.
+12.1 General Principles
+Arsitektur database harus dirancang untuk auditability, traceability, dan future scalability.
+Desain harus mendukung pemisahan yang jelas antara:
+call request data,
+runtime lifecycle events,
+transcript data,
+AI outputs,
+provider metadata,
+error logs,
+configuration snapshots.
+Desain harus mendukung penyimpanan snapshot, bukan hanya current state, agar debugging historis memungkinkan.
+Desain harus memungkinkan satu call memiliki banyak event dan banyak artifact.
+Desain harus mendukung provider-agnostic abstraction.
+Desain harus mendukung extensibility untuk masa depan, misalnya multi-tenant, campaign grouping, reusable templates, dan analytics.
+12.2 Required Data Domains
+Database harus setidaknya mampu menampung domain-domain berikut:
+Call Identity Domain
+internal call identity,
+provider identity,
+correlation ids.
+Call Request Domain
+original trigger request,
+resolved configuration,
+selected provider,
+selected model,
+target number,
+source number.
+Prompt Snapshot Domain
+original templates,
+resolved first message,
+resolved system prompt,
+variable snapshot.
+Call Lifecycle Domain
+created,
+queued,
+initiated,
+ringing,
+answered,
+machine detected,
+streaming started,
+AI connected,
+AI failed,
+hangup,
+completed,
+failed.
+Transcript Domain
+speaker separation,
+timestamps,
+partial / final transcript segments.
+AI Output Domain
+summary,
+structured output,
+confidence,
+extraction status.
+Provider Event Domain
+raw provider webhook payloads,
+normalized internal event mapping.
+Error Domain
+technical errors,
+provider errors,
+AI errors,
+validation errors.
+Operational Metadata Domain
+latency measurements,
+session timings,
+retry counts,
+warnings.
+12.3 Design Quality Expectations
+Data model harus mendukung query per call dengan mudah.
+Data model harus memungkinkan rekonstruksi perjalanan satu call dari awal sampai akhir.
+Data model harus mendukung forensic debugging.
+Data model harus memisahkan raw data dan normalized data secara masuk akal.
+Data model harus mempertimbangkan retention policy untuk transcript dan audio-related artifacts.
+Data model harus mempertimbangkan PII minimization dan secure storage.
+13. Observability and Logging Requirements
+Semua request API harus punya request_id.
+Semua call harus punya call_id internal.
+Semua provider call harus menyimpan provider_call_id.
+Semua AI session harus memiliki correlation id.
+Semua log harus structured logging, bukan plain free-text saja.
+Sistem harus bisa menjelaskan dengan jelas:
+request diterima atau tidak,
+provider call berhasil dibuat atau tidak,
+call dijawab atau tidak,
+AI session aktif atau tidak,
+first message terkirim atau tidak,
+transcript ada atau tidak,
+structured output berhasil dibuat atau tidak,
+call selesai karena apa.
+Metrics minimal harus mencakup:
+total calls triggered,
+call creation success rate,
+answer rate,
+machine detection rate,
+AI session failure rate,
+average time to first AI speech,
+average call duration,
+structured output completion rate.
+14. Security Requirements
+Trigger endpoint harus dilindungi auth token.
+Provider webhook harus diverifikasi keasliannya.
+Semua secrets harus disimpan aman.
+API key OpenAI, Twilio, dan Telnyx tidak boleh hardcoded.
+Prompt snapshot dan transcript harus diperlakukan sebagai data sensitif.
+Logging tidak boleh membocorkan credential atau data sensitif berlebihan.
+Jika audio recording dipakai di masa depan, harus ada retention dan access policy yang jelas.
+15. Deployment Requirements
+15.1 Runtime
+Backend direkomendasikan memakai Express.js (Node.js).
+Service harus containerized.
+Service harus bisa dijalankan lokal untuk development dan diuji melalui tunnel / public URL jika perlu.
+15.2 Cloud Run
+POC boleh dijalankan di Google Cloud Run.
+Cloud Run config harus disiapkan agar cocok untuk long-lived connection.
+Team engineer harus memperhatikan:
+timeout request,
+concurrency per instance,
+autoscaling behavior,
+cold start impact,
+region selection.
+Untuk POC, free-tier boleh dimanfaatkan, tetapi desain sistem tidak boleh bergantung pada asumsi bahwa concurrency tinggi akan selalu murah atau aman.
+Engineering team harus benchmark sendiri nilai concurrency ideal untuk realtime audio workload, bukan hanya memakai default.
+16. Testing Requirements
+16.1 Owner Acceptance Test
+Skenario minimum yang harus berhasil:
+Saya hit API dari Postman.
+API merespons sukses dengan call_id.
+Provider benar-benar menelepon nomor saya.
+Saat saya angkat, AI langsung berbicara.
+AI menggunakan first message sesuai template.
+AI menggunakan dynamic variable dengan benar.
+Saya dapat bercakap dengan AI.
+Setelah call selesai, saya bisa fetch hasil call.
+Hasil call berisi:
+transcript atau transcript summary,
+summary,
+structured output,
+final status,
+hangup reason.
+16.2 Negative Test Cases
+nomor invalid,
+auth invalid,
+provider credential invalid,
+AI credential invalid,
+call tidak dijawab,
+voicemail detected,
+AI session disconnect,
+structured output schema invalid,
+missing required variable untuk first message,
+provider webhook gagal diverifikasi.
+17. Engineering Deliverables
+Tim engineer minimal harus menghasilkan:
+Backend service yang bisa di-deploy.
+Provider abstraction layer.
+Twilio integration.
+Telnyx integration.
+OpenAI Realtime integration dengan gpt-realtime-mini.
+Trigger API endpoint.
+Call detail / status retrieval API.
+Manual hangup API.
+Health endpoint.
+Database architecture design.
+Logging and observability setup.
+Documentation untuk setup .env, deployment, dan testing via Postman.
+18. Required .env Variables
+Berikut daftar .env yang perlu disiapkan agar tim engineer punya baseline jelas.
+# Core App
+NODE_ENV=development
+PORT=8080
+APP_BASE_URL=https://your-service-url
+API_AUTH_TOKEN=replace_this
+LOG_LEVEL=info
+DEFAULT_LANGUAGE=id-ID
+DEFAULT_TIMEZONE=Asia/Jakarta
+# AI
+OPENAI_API_KEY=sk-...
+OPENAI_REALTIME_MODEL=gpt-realtime-mini
+OPENAI_REALTIME_URL=wss://api.openai.com/v1/realtime
+OPENAI_VOICE=alloy
+OPENAI_INPUT_AUDIO_FORMAT=pcm16
+OPENAI_OUTPUT_AUDIO_FORMAT=pcm16
+# Default Provider Selection
+VOICE_PROVIDER=twilio
+# Twilio
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+TWILIO_PHONE_NUMBER=+1...
+TWILIO_STATUS_CALLBACK_URL=https://your-domain/webhooks/twilio/status
+TWILIO_VOICE_WEBHOOK_URL=https://your-domain/webhooks/twilio/voice
+TWILIO_MEDIA_STREAM_WS_URL=wss://your-domain/ws/twilio-media
+TWILIO_ENABLE_AMD=true
+TWILIO_AMD_MODE=async
+TWILIO_RECORD_CALL=false
+# Telnyx
+TELNYX_API_KEY=KEY...
+TELNYX_CONNECTION_ID=...
+TELNYX_OUTBOUND_VOICE_PROFILE_ID=...
+TELNYX_PHONE_NUMBER=+1...
+TELNYX_CALL_EVENTS_WEBHOOK_URL=https://your-domain/webhooks/telnyx/events
+TELNYX_MEDIA_STREAM_WS_URL=wss://your-domain/ws/telnyx-media
+TELNYX_ENABLE_AMD=true
+TELNYX_RECORD_CALL=false
+# Database
+DATABASE_URL=postgresql://...
+DB_POOL_MIN=1
+DB_POOL_MAX=10
+# Call Behavior
+MAX_CALL_SECONDS=300
+MAX_SILENCE_SECONDS=10
+MAX_NO_INPUT_REPROMPTS=2
+HANGUP_ON_MACHINE=true
+HANGUP_ON_AI_ERROR=true
+ENABLE_KEYWORD_HANGUP=true
+KEYWORD_HANGUP_LIST=spam,robot,nomor tidak aktif
+ENABLE_SUMMARY=true
+ENABLE_STRUCTURED_OUTPUT=true
+# Infrastructure
+CLOUD_RUN_SERVICE_NAME=ai-calling-backend
+CLOUD_RUN_REGION=us-central1
+WEBSOCKET_IDLE_TIMEOUT_SECONDS=3600
+19. Final Implementation Direction
+Bangun backend dengan Express.s (Node.js).
+Gunakan OpenAI Realtime gpt-realtime-mini sebagai AI engine awal.
+Bangun provider abstraction dari awal.
+Implement Twilio dan Telnyx sebagai adapter terpisah.
+Jadikan test trigger API (misalnya dari Postman) sebagai acceptance gate utama.
+Buat prompt system dan structured output schema sepenuhnya configurable.
+Desain database architecture dengan fokus pada auditability, lifecycle reconstruction, dan future extensibility.
+Jangan mulai frontend sebelum alur berikut terbukti stabil:
+API hit,
+outbound call jalan,
+call diangkat,
+AI berbicara,
+transcript tercatat,
+summary terbentuk,
+structured output keluar.
+20. Database Architecture
+Database architecture untuk backend ini harus menggunakan Supabase sebagai persistence layer utama.
+Implementasi Supabase yang digunakan adalah self-hosted Supabase, sehingga koneksi backend tidak bergantung pada project Supabase cloud milik vendor.
+Supabase akan dipakai sebagai fondasi penyimpanan data backend untuk kebutuhan:
+call request,
+call lifecycle,
+transcript,
+summary,
+structured output,
+provider events,
+AI session events,
+configuration snapshot,
+error logs,
+audit trail.
+Walaupun dokumen ini tidak mewajibkan bentuk tabel, field, atau relasi tertentu, tim engineer wajib mendesain arsitektur database dengan kualitas production-minded, sehingga:
+mudah ditelusuri per call,
+mudah diaudit,
+mudah dikembangkan ke use case yang lebih besar,
+tetap rapi meskipun event call bersifat realtime dan bertahap.
+Arsitektur database harus dirancang agar mendukung pemisahan domain data yang sehat, minimal antara:
+data request awal,
+data event runtime,
+data transcript,
+data hasil AI,
+data error,
+data konfigurasi / snapshot prompt.
+Arsitektur database harus mendukung penyimpanan snapshot konfigurasi pada saat call dibuat, agar hasil call di masa depan tetap bisa direkonstruksi sesuai konfigurasi saat itu, walaupun template atau prompt sudah berubah setelahnya.
+Arsitektur database harus mendukung penyimpanan raw data dan normalized data secara seimbang, sehingga:
+payload mentah dari provider masih tersedia untuk audit / debugging,
+hasil normalisasi internal tetap tersedia untuk query operasional.
+Arsitektur database harus mendukung kemungkinan satu call memiliki:
+banyak event,
+banyak segmen transcript,
+banyak update state,
+satu atau lebih artifact hasil AI,
+satu rangkaian error / warning selama lifecycle berlangsung.
+Arsitektur database harus dirancang dengan mempertimbangkan bahwa ke depan sistem dapat berkembang menjadi:
+multi-template,
+multi-use-case,
+multi-provider,
+multi-tenant,
+analytics-ready.
+Karena Supabase berbasis PostgreSQL, tim engineer harus memanfaatkan desain relasional secara baik untuk menjaga konsistensi data, tetapi tetap mempertimbangkan fleksibilitas untuk menyimpan payload JSON / semi-structured data pada area yang memang cocok.
+Database architecture harus mempertimbangkan retention policy untuk data sensitif seperti transcript, summary, dan artifact hasil call, terutama jika nantinya sistem berkembang ke skala yang lebih besar atau ke use case yang lebih sensitif.
+Database architecture harus mempertimbangkan auditability sebagai prinsip inti, artinya setiap call idealnya bisa direkonstruksi dari awal sampai akhir melalui data yang tersimpan.
+Database architecture harus mempertimbangkan observability support, sehingga data yang tersimpan cukup untuk membantu investigasi jika terjadi masalah seperti:
+outbound call gagal,
+AI tidak berbicara,
+transcript kosong,
+structured output gagal,
+call berhenti di tengah jalan,
+provider event tidak sinkron.
+Untuk koneksi ke Supabase self-hosted, environment variable harus menyediakan minimal informasi koneksi host dan credential yang diperlukan oleh backend.
+Di file .env, konfigurasi terkait Supabase harus disiapkan secara eksplisit, dan minimal mencakup:
+SUPABASE_URL=https://your-supabase-host
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+Bila tim engineer juga membutuhkan koneksi PostgreSQL langsung untuk kebutuhan tertentu, mereka boleh menambahkan variabel koneksi database terpisah sesuai kebutuhan deployment internal, tetapi baseline requirement dokumen ini tetap menyatakan bahwa Supabase adalah database architecture utama.
+SUPABASE_SERVICE_ROLE_KEY hanya boleh digunakan di backend server-side dan tidak boleh pernah diekspos ke frontend atau client-side environment.
+Karena Supabase yang dipakai adalah self-hosted, tim engineer juga harus memastikan bahwa environment deployment backend dapat mengakses host Supabase tersebut secara stabil dan aman, termasuk mempertimbangkan:
+network connectivity,
+SSL/TLS bila digunakan,
+firewall / allowlist,
+secret management.
+Database architecture harus diperlakukan sebagai komponen inti sistem, bukan sekadar tempat simpan hasil akhir, karena seluruh lifecycle AI calling ini bergantung pada kemampuan backend untuk menyimpan, membaca, dan merekonstruksi state call dengan akurat.
+Dengan demikian, requirement final untuk database architecture adalah:
+menggunakan Supabase self-hosted,
+dikonfigurasi melalui environment variables,
+dirancang fleksibel namun audit-friendly,
+siap menopang kebutuhan backend AI calling secara generik untuk berbagai occasion / use case.
