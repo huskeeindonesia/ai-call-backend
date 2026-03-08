@@ -1,0 +1,21 @@
+{
+  "org": "Huskee IT AI Team",
+  "updatedAt": "2026-03-08T17:15:00Z",
+  "tokenUsage": { "today": 128340, "budget": 300000, "avgPerHour": 12200 },
+  "context": { "avgLength": 192000, "limit": 272000 },
+  "agents": [
+    { "name": "Astra", "role": "IT Director", "status": "active", "load": 86, "tasksOpen": 9 },
+    { "name": "Bob", "role": "Product Owner", "status": "active", "load": 72, "tasksOpen": 6 },
+    { "name": "Raymond", "role": "Solution Architect", "status": "active", "load": 78, "tasksOpen": 5 },
+    { "name": "Mika", "role": "Backend Engineer", "status": "active", "load": 91, "tasksOpen": 12 },
+    { "name": "Nia", "role": "Frontend Engineer", "status": "idle", "load": 18, "tasksOpen": 1 },
+    { "name": "Quinn", "role": "QA Lead", "status": "active", "load": 63, "tasksOpen": 7 },
+    { "name": "Diego", "role": "DevOps/SRE", "status": "active", "load": 69, "tasksOpen": 4 },
+    { "name": "Selene", "role": "Security Engineer", "status": "active", "load": 55, "tasksOpen": 3 }
+  ],
+  "schedule": [
+    { "time": "08:00 WIB", "event": "Morning Improvement Assessment", "owner": "Astra" },
+    { "time": "17:00 WIB", "event": "Evening Improvement Assessment", "owner": "Astra" }
+  ],
+  "comms": { "messages24h": 342, "handoffs": 57, "blockers": 3 }
+}
