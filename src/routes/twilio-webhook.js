@@ -39,8 +39,8 @@ router.post('/twilio/status/:callId', (req, res) => {
 
   const statusMap = {
     initiated: 'dialing',
-    ringing: 'dialing',
-    'in-progress': 'in-progress',
+    ringing: 'ringing',
+    'in-progress': 'in_progress',
     completed: 'completed',
     failed: 'failed',
     busy: 'failed',
@@ -50,11 +50,14 @@ router.post('/twilio/status/:callId', (req, res) => {
 
   const newStatus = statusMap[CallStatus];
   if (newStatus) {
-    callRepository.update(callId, { status: newStatus });
+    const patch = { status: newStatus };
+    if (CallDuration) patch.call_duration_seconds = Number(CallDuration);
+    callRepository.update(callId, patch);
     callRepository.addEvent(callId, {
       type: 'TWILIO_STATUS_CALLBACK',
       status: newStatus,
-      twilio_status: CallStatus
+      twilio_status: CallStatus,
+      duration_seconds: CallDuration ? Number(CallDuration) : undefined
     });
   }
 
