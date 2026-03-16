@@ -25,7 +25,8 @@ export const env = {
   telnyx: {
     apiKey: required('TELNYX_API_KEY', ''),
     fromNumber: required('TELNYX_FROM_NUMBER', '')
-  }
+  },
+  publicUrl: required('PUBLIC_URL', `http://localhost:${process.env.PORT || 8080}`)
 };
 
 export function assertBootConfig() {
