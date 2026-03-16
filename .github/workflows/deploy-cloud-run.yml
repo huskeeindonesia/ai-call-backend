@@ -52,4 +52,16 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --port 8080 \
-            --project "$PROJECT_ID"
+            --timeout 3600 \
+            --project "$PROJECT_ID" \
+            --set-env-vars "\
+API_AUTH_TOKEN=${{ secrets.API_AUTH_TOKEN }},\
+OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }},\
+OPENAI_REALTIME_MODEL=gpt-4o-mini-realtime-preview,\
+DEFAULT_VOICE_MODEL=gpt-4o-mini-realtime-preview,\
+DEFAULT_PROVIDER=twilio,\
+DEFAULT_LANGUAGE=id,\
+TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }},\
+TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_AUTH_TOKEN }},\
+TWILIO_FROM_NUMBER=${{ secrets.TWILIO_FROM_NUMBER }},\
+PUBLIC_URL=https://ai-call-backend-1019232428039.us-central1.run.app"
