@@ -55,13 +55,25 @@ export class TwilioOpenAIBridge {
 
       // Configure session — audio and first message are held until session.updated
       // confirms the system prompt is active (see _handleOpenAIMessage).
+      const languagePrefix =
+        'INSTRUKSI WAJIB BAHASA:\n' +
+        'Kamu harus berbicara bahasa Indonesia seperti orang Indonesia asli. WAJIB ikuti aturan ini:\n' +
+        '1. Gunakan HANYA bahasa Indonesia. Jangan pernah menyisipkan kata atau frasa bahasa asing kecuali nama produk/merek.\n' +
+        '2. Gunakan gaya bicara kasual dan natural seperti orang Indonesia sehari-hari — boleh pakai "gak", "ya", "nih", "sih", "dong", "oke", "nah", "eh", dll.\n' +
+        '3. Pelafalan harus seperti orang Indonesia asli: singkat, to the point, tidak kaku.\n' +
+        '4. Hindari kalimat yang terlalu formal atau terdengar seperti terjemahan dari bahasa asing.\n' +
+        '5. Gunakan sapaan yang wajar seperti "Halo", "Iya", "Baik" — bukan "Tentu saja!", "Dengan senang hati!" atau ungkapan khas bule.\n\n';
+
+      const instructions = languagePrefix +
+        (this.sessionConfig.systemPrompt ||
+          'Kamu adalah asisten AI yang ramah dan membantu.');
+
       this.openAiWs.send(JSON.stringify({
         type: 'session.update',
         session: {
           modalities: ['text', 'audio'],
-          instructions: this.sessionConfig.systemPrompt ||
-            'Kamu adalah asisten AI yang ramah dan membantu. Berbicara dalam bahasa Indonesia.',
-          voice: 'alloy',
+          instructions,
+          voice: 'coral',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           input_audio_transcription: { model: 'whisper-1' },
