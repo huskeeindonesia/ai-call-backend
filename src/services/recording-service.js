@@ -1,127 +1,66 @@
 import { nanoid } from 'nanoid';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { writeFile, readFile, rm, mkdir } from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
 import { supabaseRepository } from '../repositories/supabase-repository.js';
 
-// ─── G.711 μ-law → PCM16 lookup table (built once at startup) ─────────────────
-// Reference: ITU-T G.711, Section 4.2.2
-const ULAW_TO_PCM16 = (() => {
-  const table = new Int16Array(256);
-  for (let i = 0; i < 256; i++) {
-    const u = ~i & 0xff;             // invert all bits (μ-law encoding inverts)
-    const sign = u & 0x80;           // bit 7 = sign
-    const exp  = (u >> 4) & 0x07;   // bits 4-6 = exponent
-    const mant = u & 0x0f;           // bits 0-3 = mantissa
-    const magnitude = ((mant | 0x10) << (exp + 3)) - 132; // ITU-T correct formula
-    table[i] = sign ? -magnitude : magnitude;
-  }
-  return table;
-})();
+const execFileAsync = promisify(execFile);
+const MULAW_SILENCE = 0xff; // G.711 μ-law silence byte
+const SAMPLE_RATE = 8000;   // G.711 μ-law = 8 kHz, 1 byte per sample
 
-/** Decode an array of base64-encoded G.711 μ-law chunks to a PCM16 Int16Array. */
-function ulawChunksToPcm(base64Chunks) {
-  if (!base64Chunks || base64Chunks.length === 0) return new Int16Array(0);
-  const decoded = base64Chunks.map((b) => Buffer.from(b, 'base64'));
-  const totalBytes = decoded.reduce((n, b) => n + b.length, 0);
-  const pcm = new Int16Array(totalBytes);
-  let off = 0;
-  for (const chunk of decoded) {
-    for (let i = 0; i < chunk.length; i++) pcm[off++] = ULAW_TO_PCM16[chunk[i]];
-  }
-  return pcm;
-}
+// ─── Raw μ-law buffer helpers ──────────────────────────────────────────────────
 
 /**
- * Mix two PCM16 streams (caller + AI) into one by summing with clamp.
- * Handles streams of different lengths by zero-padding the shorter one.
+ * Concatenate base64-encoded μ-law chunks into a single continuous raw buffer.
+ * (inbound direction — chunks are sequential, no gaps)
  */
-function mixPcm(pcmA, pcmB) {
-  const len = Math.max(pcmA.length, pcmB.length);
-  const mixed = new Int16Array(len);
-  for (let i = 0; i < len; i++) {
-    const a = i < pcmA.length ? pcmA[i] : 0;
-    const b = i < pcmB.length ? pcmB[i] : 0;
-    mixed[i] = Math.max(-32768, Math.min(32767, a + b));
-  }
-  return mixed;
-}
-
-/** Convert mixed PCM16 Int16Array → WAV Buffer (8 kHz, mono, 16-bit). */
-function pcmToWav(pcm) {
-
-  const pcmBuf = Buffer.from(pcm.buffer);
-
-  // WAV header (44 bytes): 8 kHz, mono, 16-bit PCM
-  const sampleRate = 8000;
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-  const blockAlign = numChannels * (bitsPerSample / 8);
-
-  const header = Buffer.alloc(44);
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + pcmBuf.length, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16);            // PCM subchunk size
-  header.writeUInt16LE(1, 20);             // AudioFormat = PCM
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write('data', 36);
-  header.writeUInt32LE(pcmBuf.length, 40);
-
-  return Buffer.concat([header, pcmBuf]);
+function buildInboundBuffer(base64Chunks) {
+  return Buffer.concat(base64Chunks.map((b) => Buffer.from(b, 'base64')));
 }
 
 /**
- * Build a time-aligned PCM16 array from outbound recording turns.
- * Each turn is { ms: number, chunks: string[] } where:
- *   - ms   = wall-clock offset from call start when this AI turn began
- *   - chunks = ordered array of base64 μ-law delta payloads for this turn
+ * Build a time-aligned raw μ-law buffer from outbound turns.
  *
- * Within a turn, chunks are placed SEQUENTIALLY (no wall-clock timestamps per
- * delta — they arrived in network bursts, not real-time, so per-chunk timestamps
- * would cause massive PCM overlap and crackling).
- * Between turns, the silence gap is preserved by the ms offset.
+ * Each turn: { ms: number, chunks: string[] }
+ *   ms     = wall-clock offset from call start (milliseconds)
+ *   chunks = ordered base64 μ-law delta payloads for this AI response turn
+ *
+ * Within a turn chunks are placed sequentially (they arrive in network bursts,
+ * not real-time).  Between turns the silence gap is preserved via the ms offset.
  */
-function timedUlawChunksToPcm(timedTurns, totalSamples) {
-  const pcm = new Int16Array(totalSamples); // zero-filled = silence
+function buildOutboundBuffer(timedTurns, totalBytes) {
+  const buf = Buffer.alloc(totalBytes, MULAW_SILENCE);
   for (const { ms, chunks } of timedTurns) {
-    let samplePos = Math.round((ms / 1000) * 8000);
+    let pos = Math.max(0, Math.round((ms / 1000) * SAMPLE_RATE));
     for (const data of chunks) {
       const raw = Buffer.from(data, 'base64');
-      for (let i = 0; i < raw.length; i++) {
-        const pos = samplePos + i;
-        if (pos < totalSamples) pcm[pos] = ULAW_TO_PCM16[raw[i]];
-      }
-      samplePos += raw.length; // advance sequentially — next chunk follows immediately
+      const copyLen = Math.min(raw.length, totalBytes - pos);
+      if (copyLen > 0) raw.copy(buf, pos, 0, copyLen);
+      pos += raw.length;
     }
   }
-  return pcm;
+  return buf;
 }
 
-/** Full pipeline util used by processRecording. */
-function ulawChunksToWav(inboundChunks, outboundChunks) {
-  const inPcm = ulawChunksToPcm(inboundChunks);
-  if (!outboundChunks || outboundChunks.length === 0) return pcmToWav(inPcm);
-  // outboundChunks is [{ ms, data }] — time-aligned placement
-  const outPcm = timedUlawChunksToPcm(outboundChunks, inPcm.length);
-  return pcmToWav(mixPcm(inPcm, outPcm));
-}
+// ─── Service ───────────────────────────────────────────────────────────────────
 
 class RecordingService {
   /**
-   * Transcribe a WAV buffer using OpenAI Whisper (whisper-1 — cheapest STT model).
-   * Returns the transcript string, or null on failure.
+   * Transcribe an audio buffer using OpenAI Whisper.
    */
-  async transcribe(wavBuffer, language = 'id') {
+  async transcribe(audioBuffer, language = 'id') {
     if (!env.openAiApiKey) return null;
     try {
       const formData = new FormData();
-      formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'recording.wav');
+      formData.append(
+        'file',
+        new Blob([audioBuffer], { type: 'audio/mpeg' }),
+        'recording.mp3',
+      );
       formData.append('model', 'whisper-1');
       formData.append('language', language);
       formData.append('response_format', 'text');
@@ -145,8 +84,12 @@ class RecordingService {
   }
 
   /**
-   * Full pipeline: ulaw chunks → WAV → Supabase Storage → Whisper transcript.
-   * Returns { recordingUrl, transcriptSummary }.
+   * Full pipeline: μ-law chunks → ffmpeg mix → MP3 → Supabase Storage + Whisper.
+   *
+   * ffmpeg handles:
+   *   • correct G.711 μ-law → PCM decoding (no manual lookup table)
+   *   • proper mixing of caller + AI audio
+   *   • high-quality MP3 encoding (smaller file, better playback)
    */
   async processRecording(callId, inboundChunks, language = 'id', outboundChunks = []) {
     if (!inboundChunks || inboundChunks.length === 0) {
@@ -154,34 +97,82 @@ class RecordingService {
       return { recordingUrl: null, transcriptSummary: null };
     }
 
-    logger.info({ callId, inbound: inboundChunks.length, outbound: outboundChunks.length }, 'Processing call recording');
-
-    // 1. Convert + mix caller and AI audio to WAV
-    const wavBuffer = ulawChunksToWav(inboundChunks, outboundChunks);
-
-    // 2. Unique filename: call_id + unix-ms + random suffix
-    const filename = `${callId}-${Date.now()}-${nanoid(8)}.wav`;
-    const storagePath = `recording/${filename}`;
-
-    // 3. Upload to Supabase Storage (bucket: robocall)
-    const recordingUrl = await supabaseRepository.uploadFile(
-      'robocall',
-      storagePath,
-      wavBuffer,
-      'audio/wav',
+    logger.info(
+      { callId, inbound: inboundChunks.length, outbound: outboundChunks.length },
+      'Processing call recording',
     );
 
-    if (recordingUrl) {
-      logger.info({ callId, recordingUrl }, 'Recording uploaded to Supabase');
-    }
+    const tmpDir = path.join(os.tmpdir(), `rec-${callId}-${nanoid(6)}`);
+    await mkdir(tmpDir, { recursive: true });
 
-    // 4. Transcribe with Whisper
-    const transcriptSummary = await this.transcribe(wavBuffer, language);
-    if (transcriptSummary) {
-      logger.info({ callId, chars: transcriptSummary.length }, 'Transcription complete');
-    }
+    const inFile  = path.join(tmpDir, 'in.raw');
+    const outFile = path.join(tmpDir, 'out.raw');
+    const mp3File = path.join(tmpDir, 'mixed.mp3');
 
-    return { recordingUrl, transcriptSummary };
+    try {
+      // 1. Build continuous raw μ-law buffers
+      const inBuf = buildInboundBuffer(inboundChunks);
+
+      let ffmpegArgs;
+      if (outboundChunks.length > 0) {
+        const outBuf = buildOutboundBuffer(outboundChunks, inBuf.length);
+        await Promise.all([writeFile(inFile, inBuf), writeFile(outFile, outBuf)]);
+
+        // Two raw μ-law inputs → mix → MP3
+        ffmpegArgs = [
+          '-loglevel', 'error',
+          '-f', 'mulaw', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', inFile,
+          '-f', 'mulaw', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', outFile,
+          '-filter_complex', 'amix=inputs=2:duration=longest',
+          '-ar', '16000', '-ac', '1', '-b:a', '64k',
+          '-y', mp3File,
+        ];
+      } else {
+        await writeFile(inFile, inBuf);
+
+        // Single raw μ-law input → MP3
+        ffmpegArgs = [
+          '-loglevel', 'error',
+          '-f', 'mulaw', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', inFile,
+          '-ar', '16000', '-ac', '1', '-b:a', '64k',
+          '-y', mp3File,
+        ];
+      }
+
+      // 2. Run ffmpeg
+      await execFileAsync('ffmpeg', ffmpegArgs);
+
+      // 3. Read the encoded MP3
+      const mp3Buffer = await readFile(mp3File);
+
+      // 4. Upload to Supabase Storage (bucket: robocall)
+      const filename = `${callId}-${Date.now()}-${nanoid(8)}.mp3`;
+      const storagePath = `recording/${filename}`;
+      const recordingUrl = await supabaseRepository.uploadFile(
+        'robocall',
+        storagePath,
+        mp3Buffer,
+        'audio/mpeg',
+      );
+
+      if (recordingUrl) {
+        logger.info({ callId, recordingUrl }, 'Recording uploaded to Supabase');
+      }
+
+      // 5. Transcribe with Whisper
+      const transcriptSummary = await this.transcribe(mp3Buffer, language);
+      if (transcriptSummary) {
+        logger.info({ callId, chars: transcriptSummary.length }, 'Transcription complete');
+      }
+
+      return { recordingUrl, transcriptSummary };
+    } catch (err) {
+      logger.error({ callId, err }, 'Recording processing failed');
+      return { recordingUrl: null, transcriptSummary: null };
+    } finally {
+      // Clean up temp files
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
