@@ -83,6 +83,12 @@ class CallService {
 
       ai_session_info: null,
 
+      user_id:     input.user_id     ?? null,
+
+      campaign_id: input.campaign_id ?? null,
+
+      leads_id:    input.leads_id    ?? null,
+
     };
 
 

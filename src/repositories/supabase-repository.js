@@ -86,6 +86,9 @@ class SupabaseRepository {
       structured_output: call.structured_output ?? null,
       hangup_reason: call.hangup_reason ?? null,
       ai_session_info: call.ai_session_info ?? null,
+      user_id:     call.user_id     ?? null,
+      campaign_id: call.campaign_id ?? null,
+      leads_id:    call.leads_id    ?? null,
     };
 
     try {
