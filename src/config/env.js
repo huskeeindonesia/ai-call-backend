@@ -12,9 +12,9 @@ export const env = {
   apiAuthToken: required('API_AUTH_TOKEN', 'replace-me'),
   defaultProvider: required('DEFAULT_PROVIDER', 'twilio'),
   defaultLanguage: required('DEFAULT_LANGUAGE', 'id'),
-  defaultVoiceModel: required('DEFAULT_VOICE_MODEL', 'gpt-realtime-mini'),
+  defaultVoiceModel: required('DEFAULT_VOICE_MODEL', 'gpt-4o-mini-realtime-preview'),
   openAiApiKey: required('OPENAI_API_KEY', ''),
-  openAiRealtimeModel: required('OPENAI_REALTIME_MODEL', 'gpt-realtime-mini'),
+  openAiRealtimeModel: required('OPENAI_REALTIME_MODEL', 'gpt-4o-mini-realtime-preview'),
   supabaseUrl: required('SUPABASE_URL', ''),
   supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY', ''),
   twilio: {
@@ -25,7 +25,8 @@ export const env = {
   telnyx: {
     apiKey: required('TELNYX_API_KEY', ''),
     fromNumber: required('TELNYX_FROM_NUMBER', '')
-  }
+  },
+  publicUrl: required('PUBLIC_URL', `http://localhost:${process.env.PORT || 8080}`)
 };
 
 export function assertBootConfig() {

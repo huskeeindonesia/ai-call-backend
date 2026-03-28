@@ -1,5 +1,6 @@
 const calls = new Map();
 const events = new Map();
+const bridges = new Map();
 
 export class CallRepository {
   create(call) {
@@ -30,6 +31,12 @@ export class CallRepository {
   getEvents(callId) {
     return events.get(callId) || [];
   }
+
+  // Bridge pre-warm storage — bridges are created during ring time and retrieved
+  // when the Twilio media stream WebSocket connects.
+  storeBridge(callId, bridge) { bridges.set(callId, bridge); }
+  getBridge(callId)          { return bridges.get(callId) || null; }
+  deleteBridge(callId)       { bridges.delete(callId); }
 }
 
 export const callRepository = new CallRepository();
