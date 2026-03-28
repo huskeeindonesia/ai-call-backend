@@ -37,7 +37,7 @@ create table if not exists calls (
   structured_output        jsonb,
   hangup_reason            text,
   ai_session_info          jsonb,
-  user_id                  integer,
+  user_id                  varchar,
   campaign_id              integer,
   leads_id                 integer,
   created_at               timestamptz not null default now(),
@@ -53,7 +53,7 @@ do $$ begin
   begin alter table calls add column direction text not null default 'outbound'; exception when duplicate_column then null; end;
   begin alter table calls add column call_duration_seconds integer;             exception when duplicate_column then null; end;
   begin alter table calls add column recording_url text;                        exception when duplicate_column then null; end;
-  begin alter table calls add column user_id integer;                           exception when duplicate_column then null; end;
+  begin alter table calls add column user_id varchar;                           exception when duplicate_column then null; end;
   begin alter table calls add column campaign_id integer;                       exception when duplicate_column then null; end;
   begin alter table calls add column leads_id integer;                          exception when duplicate_column then null; end;
 end $$;

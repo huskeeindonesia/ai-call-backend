@@ -15,7 +15,7 @@ export const outboundCallSchema = z.object({
   conversation_rules: z.record(z.any()).default({}),
   termination_rules: z.record(z.any()).default({}),
   provider_options: z.record(z.any()).default({}),
-  user_id:     z.number().int().optional(),
+  user_id:     z.string().optional(),
   campaign_id: z.number().int().optional(),
   leads_id:    z.number().int().optional(),
 });
