@@ -62,7 +62,14 @@ export class TwilioOpenAIBridge {
         '2. Gunakan gaya bicara kasual dan natural seperti orang Indonesia sehari-hari — boleh pakai "gak", "ya", "nih", "sih", "dong", "oke", "nah", "eh", dll.\n' +
         '3. Pelafalan harus seperti orang Indonesia asli: singkat, to the point, tidak kaku.\n' +
         '4. Hindari kalimat yang terlalu formal atau terdengar seperti terjemahan dari bahasa asing.\n' +
-        '5. Gunakan sapaan yang wajar seperti "Halo", "Iya", "Baik" — bukan "Tentu saja!", "Dengan senang hati!" atau ungkapan khas bule.\n\n';
+        '5. Gunakan sapaan yang wajar seperti "Halo", "Iya", "Baik" — bukan "Tentu saja!", "Dengan senang hati!" atau ungkapan khas bule.\n\n' +
+        'INSTRUKSI AKHIRI PANGGILAN:\n' +
+        'Kamu WAJIB memanggil fungsi `end_call` untuk menutup telepon jika salah satu kondisi berikut terpenuhi:\n' +
+        '1. Lawan bicara bilang "sudah cukup", "terima kasih", "bye", "dadah", "makasih", atau ungkapan penutup lainnya.\n' +
+        '2. Percakapan sudah selesai secara natural — semua topik sudah dibahas dan tidak ada lagi yang perlu disampaikan.\n' +
+        '3. Lawan bicara menolak dan tidak mau melanjutkan pembicaraan.\n' +
+        '4. Lawan bicara diam terlalu lama setelah kamu sudah mencoba bertanya ulang.\n' +
+        'Sebelum memanggil `end_call`, SELALU ucapkan penutup yang sopan (misal: "Baik/terima kasih ya") lalu panggil `end_call`.\n\n';
 
       const instructions = languagePrefix +
         (this.sessionConfig.systemPrompt ||
@@ -236,7 +243,21 @@ export class TwilioOpenAIBridge {
           let reason = 'conversation_complete';
           try { reason = JSON.parse(msg.arguments || '{}').reason || reason; } catch {}
           logger.info({ callId: this.callId, reason }, 'AI requested end_call — hanging up');
-          this._hangupCall(reason);
+
+          // Acknowledge the function call so OpenAI's conversation state stays clean.
+          if (this.openAiWs?.readyState === WebSocket.OPEN) {
+            this.openAiWs.send(JSON.stringify({
+              type: 'conversation.item.create',
+              item: {
+                type: 'function_call_output',
+                call_id: msg.call_id,
+                output: JSON.stringify({ ok: true }),
+              },
+            }));
+          }
+
+          // Delay hangup so the AI's goodbye audio finishes playing to the caller.
+          setTimeout(() => this._hangupCall(reason), 3000);
         }
         break;
 
