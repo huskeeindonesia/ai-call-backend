@@ -6,6 +6,15 @@ import { recordingService } from '../services/recording-service.js';
 import { supabaseRepository } from '../repositories/supabase-repository.js';
 import { callRepository } from '../repositories/call-repository.js';
 
+// Lazy-loaded to avoid circular dependency (call-service → bridge → call-service).
+let _CallService;
+function getCallService() {
+  if (!_CallService) {
+    _CallService = import('../services/call-service.js').then(m => m.CallService);
+  }
+  return _CallService;
+}
+
 /**
  * Bridges a Twilio Media Stream WebSocket ↔ OpenAI Realtime API.
  *
@@ -34,7 +43,25 @@ export class TwilioOpenAIBridge {
     this._prewarmTimeout = null;      // closes OpenAI if call is never answered
     this._aiIsSpeaking = false;       // true only while AI audio deltas are arriving (used for barge-in guard)
     this._suppressOutbound = false;   // true only during barge-in: drops stray AI deltas already in-flight
+    this._bargedIn = false;           // true after barge-in, reset when AI starts new response
     this._callStartTime = Date.now(); // reset to actual call-answer time in 'start' handler
+
+    // ─── Silence detection ──────────────────────────────────────────────────────
+    this._lastActivityTime = Date.now();
+    this._silenceCheckInterval = null;
+    this._silenceThresholdMs = 7_000;       // 7s no speech → hang up
+    this._holdGraceUntil = 0;               // pause silence check until this timestamp
+
+    // ─── Voicemail / robot detection (Indonesian telco) ─────────────────────────
+    this._voicemailKeywords = [
+      'rekam pesan', 'voicemail', 'pesan suara', 'tekan tombol',
+      'mailbox', 'tinggalkan pesan', 'nada sela', 'kotak suara',
+      'sedang tidak aktif', 'tidak dapat dihubungi', 'di luar jangkauan',
+      'nomor yang anda tuju', 'sedang sibuk', 'tidak menjawab',
+      'setelah nada', 'silakan tinggalkan', 'meninggalkan pesan',
+    ];
+    this._holdKeywords = ['tunggu', 'sebentar', 'bentar'];
+    this._voicemailWindowMs = 30_000;       // only check voicemail in first 30s
   }
 
   // ─── OpenAI connection ──────────────────────────────────────────────────────
@@ -200,6 +227,7 @@ export class TwilioOpenAIBridge {
         // AI audio stream for this turn ended (normal completion).
         // Mark not-speaking so a subsequent speech_started is a new turn, not barge-in.
         this._aiIsSpeaking = false;
+        this._lastActivityTime = Date.now(); // start silence countdown after AI finishes
         if (this.streamSid && this.twilioWs?.readyState === WebSocket.OPEN) {
           this.twilioWs.send(JSON.stringify({
             event: 'mark',
@@ -226,15 +254,38 @@ export class TwilioOpenAIBridge {
         break;
 
       case 'input_audio_buffer.speech_started':
-        // Caller started speaking.
+        // Caller started speaking — reset silence timer.
+        this._lastActivityTime = Date.now();
         // ONLY treat this as barge-in if the AI is currently streaming audio.
         // If _aiIsSpeaking is false (AI already finished its turn), this is a normal
         // conversational turn — do NOT suppress, or the AI's response will be silently dropped.
         if (this._aiIsSpeaking) {
           this._suppressOutbound = true;
+          this._bargedIn = true;
+          // Clear Twilio playback buffer so caller hears silence immediately.
           if (this.streamSid && this.twilioWs.readyState === WebSocket.OPEN) {
             this.twilioWs.send(JSON.stringify({ event: 'clear', streamSid: this.streamSid }));
           }
+          // Cancel the in-flight OpenAI response so it stops generating audio.
+          if (this.openAiWs?.readyState === WebSocket.OPEN) {
+            this.openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
+          }
+          logger.info({ callId: this.callId }, 'Barge-in: cancelled AI response, listening to customer');
+        }
+        break;
+
+      case 'input_audio_buffer.speech_stopped':
+        // Customer finished speaking.
+        // After a barge-in, delay 1s before letting the AI respond for a natural feel.
+        if (this._bargedIn) {
+          this._bargedIn = false;
+          logger.info({ callId: this.callId }, 'Barge-in speech ended — delaying AI response 1s');
+          setTimeout(() => {
+            if (this.openAiWs?.readyState === WebSocket.OPEN) {
+              this.openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+              this.openAiWs.send(JSON.stringify({ type: 'response.create' }));
+            }
+          }, 1_000);
         }
         break;
 
@@ -261,10 +312,64 @@ export class TwilioOpenAIBridge {
         }
         break;
 
+      case 'conversation.item.input_audio_transcription.completed':
+        if (msg.transcript) {
+          this._lastActivityTime = Date.now();
+          if (!this._checkVoicemailKeywords(msg.transcript)) {
+            this._checkHoldRequest(msg.transcript);
+          }
+        }
+        break;
+
       case 'error':
         logger.error({ callId: this.callId, error: msg.error }, 'OpenAI Realtime error event');
         break;
     }
+  }
+
+  // ─── Voicemail & silence detection ──────────────────────────────────────────
+
+  _startSilenceDetection() {
+    this._lastActivityTime = Date.now();
+    this._silenceCheckInterval = setInterval(() => {
+      if (this._aiIsSpeaking) return;                       // AI is talking — not silence
+      if (Date.now() < this._holdGraceUntil) return;       // customer said "tunggu"
+      const silentMs = Date.now() - this._lastActivityTime;
+      if (silentMs >= this._silenceThresholdMs) {
+        logger.info({ callId: this.callId, silentMs }, 'Silence threshold exceeded — hanging up');
+        clearInterval(this._silenceCheckInterval);
+        this._silenceCheckInterval = null;
+        this._hangupCall('silence_timeout');
+      }
+    }, 1_000);
+  }
+
+  _checkVoicemailKeywords(transcript) {
+    if (Date.now() - this._callStartTime > this._voicemailWindowMs) return false;
+    const lower = transcript.toLowerCase();
+    for (const kw of this._voicemailKeywords) {
+      if (lower.includes(kw)) {
+        logger.info({ callId: this.callId, keyword: kw, transcript }, 'Voicemail/robot detected — hanging up');
+        clearInterval(this._silenceCheckInterval);
+        this._silenceCheckInterval = null;
+        this._hangupCall('voicemail_detected');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _checkHoldRequest(transcript) {
+    const lower = transcript.toLowerCase();
+    for (const kw of this._holdKeywords) {
+      if (lower.includes(kw)) {
+        logger.info({ callId: this.callId, keyword: kw }, 'Hold requested — pausing silence detection 30s');
+        this._holdGraceUntil = Date.now() + 30_000;
+        this._lastActivityTime = Date.now();
+        return true;
+      }
+    }
+    return false;
   }
 
   async _hangupCall(reason = 'ai_ended') {
@@ -302,6 +407,7 @@ export class TwilioOpenAIBridge {
             // Cold start (inbound call or pre-warm failed) — connect now.
             this.connectToOpenAI();
           }
+          this._startSilenceDetection();
           break;
 
         case 'media': {
@@ -399,10 +505,20 @@ export class TwilioOpenAIBridge {
     });
 
     logger.info({ callId: this.callId, durationSeconds, hasRecording: Boolean(recordingUrl), hasTranscript: Boolean(transcriptSummary) }, 'Call finalized');
+
+    // Release concurrency slot (safe to call even if already released by status callback)
+    try {
+      const CS = await getCallService();
+      CS.releaseSlot(this.callId);
+    } catch (e) {
+      logger.warn({ callId: this.callId, err: e }, 'Failed to release slot in finalization');
+    }
   }
 
   close() {
     clearTimeout(this._prewarmTimeout);
+    clearInterval(this._silenceCheckInterval);
+    this._silenceCheckInterval = null;
     this._openAiReady = false;
     this.openAiWs?.close();
   }

@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import { env } from '../config/env.js';
 import { callRepository } from '../repositories/call-repository.js';
 import { supabaseRepository } from '../repositories/supabase-repository.js';
+import { CallService } from '../services/call-service.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
@@ -68,6 +69,12 @@ router.post('/twilio/status/:callId', async (req, res) => {
       status: newStatus,
       twilio_status: CallStatus,
     });
+
+    // Release concurrency slot on terminal states
+    const terminalStatuses = ['completed', 'failed', 'canceled'];
+    if (terminalStatuses.includes(newStatus)) {
+      CallService.releaseSlot(callId);
+    }
   }
 
   res.sendStatus(200);

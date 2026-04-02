@@ -2,6 +2,7 @@ import { AppError } from '../core/errors.js';
 
 export function errorHandler(err, req, res, _next) {
   const requestId = req.id;
+
   if (err instanceof AppError) {
     return res.status(err.status).json({
       error: { code: err.code, message: err.message, details: err.details },

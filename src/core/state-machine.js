@@ -1,4 +1,5 @@
 const allowed = {
+  pending_queue: ['queued', 'canceled'],
   queued: ['dialing', 'failed', 'canceled'],
   dialing: ['ringing', 'failed', 'canceled'],
   ringing: ['answered', 'voicemail', 'failed', 'canceled'],

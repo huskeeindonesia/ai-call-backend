@@ -17,10 +17,23 @@ import { TwilioOpenAIBridge } from '../realtime/bridge.js';
 
 import { supabaseRepository } from '../repositories/supabase-repository.js';
 
+import { callQueueService } from './call-queue-service.js';
+import { logger } from '../utils/logger.js';
+
 
 
 class CallService {
 
+  constructor() {
+    // Register background executor so the queue can pick up parked calls.
+    callQueueService.setExecuteCallback((callId, payload) => this._executeCall(callId, payload));
+  }
+
+  /**
+   * Accept an outbound call request.
+   * Always returns immediately (202) — the call either executes right away
+   * or is parked in the queue and picked up automatically.
+   */
   async createOutboundCall(payload) {
 
     const parsed = outboundCallSchema.safeParse(payload);
@@ -35,6 +48,8 @@ class CallService {
 
     const input = parsed.data;
 
+    const userId = String(input.user_id ?? 'default');
+
     const provider = input.provider || env.defaultProvider;
 
     const adapter = resolveAdapter(provider);
@@ -42,6 +57,8 @@ class CallService {
     if (!adapter) throw new AppError('INVALID_REQUEST', `Unknown provider: ${provider}`, 400);
 
 
+
+    // Create call record immediately so the client always gets a call_id back.
 
     const call_id = `call_${nanoid(12)}`;
 
@@ -99,80 +116,208 @@ class CallService {
 
 
 
-    const providerRes = await adapter.createOutboundCall({ ...input, call_id, from: input.from || null });
+    // ─── Concurrency gate ─────────────────────────────────────────────────
 
-    this.#transition(call_id, providerRes.status || 'dialing');
+    const { immediate, position } = callQueueService.tryAcquire(userId, call_id, input);
 
-
-
-    const aiSession = await realtimeOrchestrator.initSession({ ...input, call_id, voice_model: entity.voice_model });
+    const queueStatus = callQueueService.getStatus(userId);
 
 
 
-    const updated = callRepository.update(call_id, {
+    if (immediate) {
 
-      provider_call_id: providerRes.provider_call_id,
+      // Slot available — execute in background (don't block the HTTP response).
 
-      ai_session_info: aiSession,
+      this._executeCall(call_id, input).catch((err) => {
 
-    });
+        logger.error({ callId: call_id, err }, 'Immediate call execution failed');
 
-    // Pre-warm the OpenAI Realtime session during ring time (~5-10s available).
-    // The AI greeting will be fully generated and buffered before the caller even
-    // answers — resulting in near-instant audio playback on pick-up.
-    const bridge = new TwilioOpenAIBridge(null, call_id, {
-      systemPrompt: aiSession.system_prompt,
-      firstMessage: aiSession.first_message,
-      language: aiSession.language || entity.language,
-    });
-    callRepository.storeBridge(call_id, bridge);
-    bridge.connectToOpenAI(); // non-blocking — runs in background during ring time
+        callQueueService.release(userId, call_id);
+
+      });
+
+
+
+      return {
+
+        call_id,
+
+        status: 'queued',
+
+        message: 'Call is being executed now.',
+
+        queue: queueStatus,
+
+      };
+
+    }
+
+
+
+    // Parked — update status so the client knows it's waiting.
+
+    callRepository.update(call_id, { status: 'pending_queue' });
 
     callRepository.addEvent(call_id, {
 
-      type: 'PROVIDER_CALL_CREATED',
+      type: 'QUEUED',
 
-      provider,
+      position,
 
-      provider_call_id: providerRes.provider_call_id,
+      active: queueStatus.active,
 
-      provider_raw: providerRes.raw,
-
-    });
-
-
-
-    callRepository.addEvent(call_id, {
-
-      type: 'AI_SESSION_INITIALIZED',
-
-      ai_session_id: aiSession.ai_session_id,
-
-      first_message: aiSession.first_message,
+      limit: queueStatus.limit,
 
     });
 
 
 
-    // Persist initial call record to Supabase immediately
+    // Persist to Supabase so it's visible in dashboards.
 
     await supabaseRepository.upsertCall(callRepository.get(call_id));
 
-    await supabaseRepository.insertEvent(call_id, { type: 'CALL_CREATED', status: 'queued' });
+    await supabaseRepository.insertEvent(call_id, {
+
+      type: 'QUEUED',
+
+      position,
+
+      active: queueStatus.active,
+
+      limit: queueStatus.limit,
+
+    });
 
 
 
     return {
 
-      call_id: updated.call_id,
+      call_id,
 
-      status: updated.status,
+      status: 'pending_queue',
 
-      provider: updated.provider,
+      message: `Call queued at position ${position}. It will be executed automatically when a slot opens.`,
 
-      provider_call_id: updated.provider_call_id,
+      queue: queueStatus,
 
     };
+
+  }
+
+
+
+  /**
+   * Internal: actually execute the Twilio call + OpenAI bridge.
+   * Called either immediately (if slot was free) or by the queue drain callback.
+   */
+  async _executeCall(callId, input) {
+
+    const call = callRepository.get(callId);
+
+    if (!call) throw new AppError('NOT_FOUND', 'Call not found', 404);
+
+    const userId = String(call.user_id ?? 'default');
+
+    const provider = call.provider;
+
+    const adapter = resolveAdapter(provider);
+
+
+
+    try {
+
+      // If call was parked, transition status.
+
+      if (call.status === 'pending_queue') {
+
+        callRepository.update(callId, { status: 'queued' });
+
+        callRepository.addEvent(callId, { type: 'QUEUE_PICKED_UP', status: 'queued' });
+
+      }
+
+
+
+      const providerRes = await adapter.createOutboundCall({ ...input, call_id: callId, from: input.from || null });
+
+      this.#transition(callId, providerRes.status || 'dialing');
+
+
+
+      const aiSession = await realtimeOrchestrator.initSession({ ...input, call_id: callId, voice_model: call.voice_model });
+
+
+
+      callRepository.update(callId, {
+
+        provider_call_id: providerRes.provider_call_id,
+
+        ai_session_info: aiSession,
+
+      });
+
+      // Pre-warm the OpenAI Realtime session during ring time.
+      const bridge = new TwilioOpenAIBridge(null, callId, {
+        systemPrompt: aiSession.system_prompt,
+        firstMessage: aiSession.first_message,
+        language: aiSession.language || call.language,
+      });
+      callRepository.storeBridge(callId, bridge);
+      bridge.connectToOpenAI();
+
+      callRepository.addEvent(callId, {
+
+        type: 'PROVIDER_CALL_CREATED',
+
+        provider,
+
+        provider_call_id: providerRes.provider_call_id,
+
+        provider_raw: providerRes.raw,
+
+      });
+
+
+
+      callRepository.addEvent(callId, {
+
+        type: 'AI_SESSION_INITIALIZED',
+
+        ai_session_id: aiSession.ai_session_id,
+
+        first_message: aiSession.first_message,
+
+      });
+
+
+
+      // Persist to Supabase.
+
+      await supabaseRepository.upsertCall(callRepository.get(callId));
+
+      await supabaseRepository.insertEvent(callId, { type: 'CALL_CREATED', status: 'queued' });
+
+
+
+      logger.info({ callId, provider, userId }, 'Call execution started successfully');
+
+    } catch (err) {
+
+      // Mark call as failed and release the slot.
+
+      callRepository.update(callId, { status: 'failed', hangup_reason: `execution_error: ${err.message}` });
+
+      callRepository.addEvent(callId, { type: 'EXECUTION_FAILED', error: err.message });
+
+      await supabaseRepository.updateCall(callId, { status: 'failed', hangup_reason: `execution_error: ${err.message}` }).catch(() => {});
+
+      callQueueService.release(userId, callId);
+
+      logger.error({ callId, userId, err }, 'Call execution failed — slot released');
+
+      throw err;
+
+    }
 
   }
 
@@ -240,6 +385,26 @@ class CallService {
 
     if (!call) throw new AppError('NOT_FOUND', 'Call not found', 404);
 
+    const userId = String(call.user_id ?? 'default');
+
+
+
+    // If still in queue (not yet executing), just remove from queue.
+
+    if (call.status === 'pending_queue') {
+
+      callQueueService.dequeue(userId, callId);
+
+      callRepository.update(callId, { status: 'canceled', hangup_reason: 'manual_hangup_from_queue' });
+
+      callRepository.addEvent(callId, { type: 'MANUAL_HANGUP', status: 'canceled' });
+
+      await supabaseRepository.updateCall(callId, { status: 'canceled', hangup_reason: 'manual_hangup_from_queue' });
+
+      return { call_id: callId, status: 'canceled', hangup_reason: 'manual_hangup_from_queue' };
+
+    }
+
 
 
     const adapter = resolveAdapter(call.provider);
@@ -262,13 +427,26 @@ class CallService {
 
     await supabaseRepository.updateCall(callId, { status: 'canceled', hangup_reason: 'manual_hangup' });
 
-
+    // Release concurrency slot
+    CallService.releaseSlot(callId);
 
     return { call_id: callId, status: updated.status, hangup_reason: updated.hangup_reason };
 
   }
 
 
+
+  /**
+   * Release the concurrency slot held by a call.
+   * Safe to call multiple times — second call is a no-op.
+   * Should be invoked whenever a call reaches a terminal state
+   * (completed, failed, canceled, voicemail_detected, silence_timeout, etc).
+   */
+  static releaseSlot(callId) {
+    const call = callRepository.get(callId);
+    const userId = String(call?.user_id ?? 'default');
+    callQueueService.release(userId, callId);
+  }
 
   #transition(callId, next) {
 
@@ -294,4 +472,5 @@ class CallService {
 
 }
 
+export { CallService };
 export const callService = new CallService();

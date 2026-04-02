@@ -21,7 +21,7 @@ create table if not exists calls (
   status                   text        not null
                              constraint calls_status_check
                              check (status in (
-                               'queued','dialing','ringing','answered',
+                               'pending_queue','queued','dialing','ringing','answered',
                                'in_progress','voicemail',
                                'completed','failed','canceled'
                              )),
@@ -70,3 +70,40 @@ create table if not exists call_events (
 
 create index if not exists idx_call_events_call_id_created_at
   on call_events(call_id, created_at);
+
+-- ─── user_concurrency_limits ─────────────────────────────────────────────────
+-- Per-user concurrency settings for the call queue system.
+-- If a user_id has no row here, the application default (10) is used.
+create table if not exists user_concurrency_limits (
+  user_id            varchar     primary key,
+  max_concurrent     integer     not null default 10
+                       constraint positive_concurrent check (max_concurrent > 0),
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+
+create or replace trigger user_concurrency_limits_set_updated_at
+  before update on user_concurrency_limits
+  for each row execute function set_updated_at();
+
+-- ─── call_queue_log ──────────────────────────────────────────────────────────
+-- Observability: tracks queue events (enqueued, slot_acquired, released, timeout).
+create table if not exists call_queue_log (
+  id            bigserial   primary key,
+  user_id       varchar     not null,
+  call_id       text,
+  queue_id      text,
+  event_type    text        not null
+                  constraint cql_event_type_check
+                  check (event_type in ('enqueued','slot_acquired','released','timeout','rejected')),
+  active_count  integer,
+  queue_length  integer,
+  concurrency_limit integer,
+  waited_ms     integer,
+  metadata      jsonb,
+  created_at    timestamptz not null default now()
+);
+
+create index if not exists idx_call_queue_log_user_id_created_at
+  on call_queue_log(user_id, created_at);
+
