@@ -45,6 +45,7 @@ export class TwilioOpenAIBridge {
     this._suppressOutbound = false;   // true only during barge-in: drops stray AI deltas already in-flight
     this._bargedIn = false;           // true after barge-in, reset when AI starts new response
     this._bargedInResponseTimer = null; // debounce: wait for user to fully finish before AI responds
+    this._awaitingMarkAck = false;      // true while Twilio is playing AI audio (between mark sent and mark ACK)
     this._callStartTime = Date.now(); // reset to actual call-answer time in 'start' handler
 
     // ─── Silence detection ──────────────────────────────────────────────────────
@@ -200,7 +201,12 @@ export class TwilioOpenAIBridge {
 
       case 'response.audio.delta':
         // Mark AI as speaking (used by barge-in guard below).
+        // Also reset silence timer on the first delta of each AI turn, so the
+        // 7-second countdown only starts after the last speaker (user OR AI) finishes.
         this._aiIsSpeaking = true;
+        if (this._currentTurnStartMs === null) {
+          this._lastActivityTime = Date.now();
+        }
         if (msg.delta && !this._suppressOutbound) {
           if (!this.streamSid) {
             // Pre-warm path: Twilio stream not yet open.
@@ -228,14 +234,20 @@ export class TwilioOpenAIBridge {
       case 'response.audio.done':
         // AI audio stream for this turn ended (normal completion).
         // Mark not-speaking so a subsequent speech_started is a new turn, not barge-in.
+        // NOTE: do NOT reset _lastActivityTime here — audio is still buffered in Twilio
+        // and the user hasn't heard it yet. Timer is reset in the Twilio 'mark' handler
+        // once Twilio confirms the audio has actually been played out to the caller.
         this._aiIsSpeaking = false;
-        this._lastActivityTime = Date.now(); // start silence countdown after AI finishes
         if (this.streamSid && this.twilioWs?.readyState === WebSocket.OPEN) {
+          this._awaitingMarkAck = true;   // pause silence check until Twilio ACKs the mark
           this.twilioWs.send(JSON.stringify({
             event: 'mark',
             streamSid: this.streamSid,
             mark: { name: 'response_done' },
           }));
+        } else {
+          // No stream yet (prewarm) — fallback so timer isn't stuck.
+          this._lastActivityTime = Date.now();
         }
         break;
 
@@ -267,6 +279,8 @@ export class TwilioOpenAIBridge {
           // Cancel any pending post-barge-in response timer.
           clearTimeout(this._bargedInResponseTimer);
           this._bargedInResponseTimer = null;
+          // User is speaking — no longer waiting for mark ACK.
+          this._awaitingMarkAck = false;
           // Disable VAD auto-response so OpenAI does NOT fire on every 600ms pause
           // while the user is still formulating their sentence.
           this._setVadAutoResponse(false);
@@ -388,7 +402,8 @@ export class TwilioOpenAIBridge {
   _startSilenceDetection() {
     this._lastActivityTime = Date.now();
     this._silenceCheckInterval = setInterval(() => {
-      if (this._aiIsSpeaking) return;                       // AI is talking — not silence
+      if (this._aiIsSpeaking) return;                       // AI is generating/streaming audio
+      if (this._awaitingMarkAck) return;                   // Twilio still playing AI audio to caller
       if (Date.now() < this._holdGraceUntil) return;       // customer said "tunggu"
       const silentMs = Date.now() - this._lastActivityTime;
       if (silentMs >= this._silenceThresholdMs) {
@@ -479,6 +494,17 @@ export class TwilioOpenAIBridge {
           break;
         }
 
+        case 'mark':
+          // Twilio sends this back once all audio buffered before the mark has been
+          // played out to the caller. This is the accurate "user just finished hearing
+          // the AI" signal — reset silence countdown from here, not from response.audio.done.
+          if (msg.mark?.name === 'response_done') {
+            this._awaitingMarkAck = false;
+            this._lastActivityTime = Date.now();
+            logger.debug({ callId: this.callId }, 'Twilio mark ACK: AI audio fully played, silence countdown started');
+          }
+          break;
+
         case 'stop':
           logger.info({ callId: this.callId }, 'Twilio stream stopped');
           this.openAiWs?.close();
@@ -514,6 +540,19 @@ export class TwilioOpenAIBridge {
     this._openAiReady = true;
     for (const chunk of this._pendingAudio) this._sendAudioToOpenAI(chunk);
     this._pendingAudio = [];
+
+    // Send a mark so Twilio ACKs us when the greeting finishes playing.
+    // The mark handler will then reset _lastActivityTime — ensuring the silence
+    // countdown starts only AFTER the user has actually heard the full greeting,
+    // not from when OpenAI finished generating it (which could be seconds earlier).
+    if (this.twilioWs?.readyState === WebSocket.OPEN) {
+      this._awaitingMarkAck = true;
+      this.twilioWs.send(JSON.stringify({
+        event: 'mark',
+        streamSid: this.streamSid,
+        mark: { name: 'response_done' },
+      }));
+    }
   }
 
   _sendAudioToOpenAI(base64Payload) {
