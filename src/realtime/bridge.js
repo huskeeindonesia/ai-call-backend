@@ -44,6 +44,7 @@ export class TwilioOpenAIBridge {
     this._aiIsSpeaking = false;       // true only while AI audio deltas are arriving (used for barge-in guard)
     this._suppressOutbound = false;   // true only during barge-in: drops stray AI deltas already in-flight
     this._bargedIn = false;           // true after barge-in, reset when AI starts new response
+    this._bargedInResponseTimer = null; // debounce: wait for user to fully finish before AI responds
     this._callStartTime = Date.now(); // reset to actual call-answer time in 'start' handler
 
     // ─── Silence detection ──────────────────────────────────────────────────────
@@ -111,11 +112,12 @@ export class TwilioOpenAIBridge {
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           input_audio_transcription: { model: 'whisper-1' },
+          input_audio_noise_reduction: { type: 'near_field' }, // suppress background noise (cooking, traffic, etc.)
           turn_detection: {
             type: 'server_vad',
-            threshold: 0.5,
+            threshold: 0.65,         // higher = less sensitive to background noise; 0.5 was too trigger-happy
             prefix_padding_ms: 300,
-            silence_duration_ms: 600,  // 600ms feels more natural than 800ms on phone
+            silence_duration_ms: 600,
           },
           temperature: 0.8,
           tools: [
@@ -262,6 +264,12 @@ export class TwilioOpenAIBridge {
         if (this._aiIsSpeaking) {
           this._suppressOutbound = true;
           this._bargedIn = true;
+          // Cancel any pending post-barge-in response timer.
+          clearTimeout(this._bargedInResponseTimer);
+          this._bargedInResponseTimer = null;
+          // Disable VAD auto-response so OpenAI does NOT fire on every 600ms pause
+          // while the user is still formulating their sentence.
+          this._setVadAutoResponse(false);
           // Clear Twilio playback buffer so caller hears silence immediately.
           if (this.streamSid && this.twilioWs.readyState === WebSocket.OPEN) {
             this.twilioWs.send(JSON.stringify({ event: 'clear', streamSid: this.streamSid }));
@@ -271,21 +279,36 @@ export class TwilioOpenAIBridge {
             this.openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
           }
           logger.info({ callId: this.callId }, 'Barge-in: cancelled AI response, listening to customer');
+        } else if (this._bargedIn) {
+          // User started speaking again while we were waiting to respond post-barge-in.
+          // Cancel the pending response timer and keep waiting.
+          clearTimeout(this._bargedInResponseTimer);
+          this._bargedInResponseTimer = null;
+          logger.info({ callId: this.callId }, 'Barge-in: user still speaking — holding AI response');
         }
         break;
 
       case 'input_audio_buffer.speech_stopped':
         // Customer finished speaking.
-        // After a barge-in, delay 1s before letting the AI respond for a natural feel.
+        // After a barge-in, use a cancellable debounce before letting the AI respond.
+        // server_vad auto-commits the audio buffer on each speech_stopped even when
+        // create_response is false — so we don't need manual commit here.
+        // If the user starts speaking again before the timer fires (speech_started above),
+        // the timer is cancelled, preventing the AI from firing on a mid-sentence pause.
         if (this._bargedIn) {
-          this._bargedIn = false;
-          logger.info({ callId: this.callId }, 'Barge-in speech ended — delaying AI response 1s');
-          setTimeout(() => {
+          clearTimeout(this._bargedInResponseTimer);
+          this._bargedInResponseTimer = setTimeout(() => {
+            this._bargedIn = false;
+            this._bargedInResponseTimer = null;
+            logger.info({ callId: this.callId }, 'Barge-in speech ended — re-enabling auto-response and responding');
+            // Re-enable VAD auto-response for all subsequent turns.
+            this._setVadAutoResponse(true);
+            // Manually trigger response for the user's now-committed audio.
             if (this.openAiWs?.readyState === WebSocket.OPEN) {
-              this.openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
               this.openAiWs.send(JSON.stringify({ type: 'response.create' }));
             }
-          }, 1_000);
+          }, 2_000);
+          logger.info({ callId: this.callId }, 'Barge-in: user paused — waiting 2s before AI responds');
         }
         break;
 
@@ -313,17 +336,50 @@ export class TwilioOpenAIBridge {
         break;
 
       case 'conversation.item.input_audio_transcription.completed':
-        if (msg.transcript) {
+        if (msg.transcript && msg.transcript.trim()) {
           this._lastActivityTime = Date.now();
           if (!this._checkVoicemailKeywords(msg.transcript)) {
             this._checkHoldRequest(msg.transcript);
           }
+        } else {
+          // Empty transcript = VAD triggered on background noise (e.g. pan/clanging), not speech.
+          // Cancel regardless of whether the AI has already started speaking or is still
+          // generating — both states mean the AI is responding to noise, not a real utterance.
+          if (this.openAiWs?.readyState === WebSocket.OPEN) {
+            this.openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
+          }
+          if (this.streamSid && this.twilioWs?.readyState === WebSocket.OPEN) {
+            this.twilioWs.send(JSON.stringify({ event: 'clear', streamSid: this.streamSid }));
+          }
+          logger.info({ callId: this.callId }, 'Empty transcript — background noise triggered VAD, cancelled response');
         }
         break;
 
       case 'error':
         logger.error({ callId: this.callId, error: msg.error }, 'OpenAI Realtime error event');
         break;
+    }
+  }
+
+  // ─── VAD helpers ────────────────────────────────────────────────────────────
+
+  // Temporarily enable or disable the server VAD's automatic response creation.
+  // When disabled, VAD still detects speech and commits audio buffers, but will
+  // NOT auto-fire response.create — giving us manual control after a barge-in.
+  _setVadAutoResponse(enabled) {
+    if (this.openAiWs?.readyState === WebSocket.OPEN) {
+      this.openAiWs.send(JSON.stringify({
+        type: 'session.update',
+        session: {
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.65,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 600,
+            create_response: enabled,
+          },
+        },
+      }));
     }
   }
 
@@ -517,6 +573,7 @@ export class TwilioOpenAIBridge {
 
   close() {
     clearTimeout(this._prewarmTimeout);
+    clearTimeout(this._bargedInResponseTimer);
     clearInterval(this._silenceCheckInterval);
     this._silenceCheckInterval = null;
     this._openAiReady = false;

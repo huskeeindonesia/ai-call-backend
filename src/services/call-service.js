@@ -36,6 +36,19 @@ class CallService {
    */
   async createOutboundCall(payload) {
 
+    // ─── Normalise common n8n serialisation quirks ───────────────────────────
+    // n8n sometimes serialises missing fields as the literal string "null",
+    // "undefined", or an empty/whitespace-only string.  Treat all of these as
+    // absent so we can return a clean skip response instead of a 400 error that
+    // would abort the entire loop.
+    const rawTo = typeof payload?.to === 'string' ? payload.to.trim() : null;
+    const FALSY_STRINGS = new Set(['null', 'undefined', 'none', 'n/a', '-', '']);
+    if (!rawTo || FALSY_STRINGS.has(rawTo.toLowerCase())) {
+      logger.warn({ payload }, 'createOutboundCall: empty/invalid `to` — skipping call gracefully');
+      return { status: 'skipped', reason: 'missing_to_number' };
+    }
+    payload = { ...payload, to: rawTo };
+
     const parsed = outboundCallSchema.safeParse(payload);
 
     if (!parsed.success) {
